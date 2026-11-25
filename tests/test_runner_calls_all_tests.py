@@ -35,22 +35,6 @@ RUNNER_SKIPS = {
         # drop this entry once that merges and the runner calls test_depth() first.
         "test_depth",
     },
-    "tests/test_feature_scan.py": {
-        # Its __main__ runner calls every test_* through run_tests([... for ... in globals().items() ...]), a
-        # comprehension dispatches_tests() does not follow, so each top-level test is listed here.
-        "test_feature_scan",
-        "test_short_signature",
-        "test_part_payload_outside_container_is_unreadable",
-        "test_bad_shaders_folder_is_one_line",
-        "test_out_inside_corpus_is_a_usage_error",
-        "test_duplicate_shader_names_keep_file_stages",
-        "test_v_perm_b32_selectors",
-        "test_typed_buffers_and_psv0",
-        "test_a_test_that_raises_fails_the_run_and_the_rest_still_run",
-        "test_a_failed_check_fails_only_its_own_test",
-        "test_out_via_directory_alias_into_corpus_is_a_usage_error",
-        "test_out_hard_link_to_carved_index_is_a_usage_error",
-    },
 }
 
 
@@ -62,9 +46,21 @@ def runner_block(tree):
     return None
 
 
+def _reads_globals(node):
+    return any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+               and n.func.id in ("globals", "locals", "vars") for n in ast.walk(node))
+
+
 def dispatches_tests(block):
-    """True when the runner runs its tests through a loop over module globals and calls the loop variable."""
+    """True when the runner runs its tests through a loop over module globals and calls the loop variable, or
+    hands a comprehension over module globals to a call, as run_tests([fn for name, fn in globals().items() ...])
+    in tests/test_feature_scan.py does."""
     for node in ast.walk(block):
+        if isinstance(node, ast.Call):
+            for arg in [*node.args, *(k.value for k in node.keywords)]:
+                if (isinstance(arg, (ast.ListComp, ast.GeneratorExp, ast.SetComp))
+                        and any(_reads_globals(g.iter) for g in arg.generators)):
+                    return True
         if not isinstance(node, ast.For):
             continue
         targets = {t.id for t in ast.walk(node.target) if isinstance(t, ast.Name)}
@@ -123,6 +119,18 @@ class RunnerCallsTestsTest(unittest.TestCase):
         self.assertEqual(uncalled_tests(source), [])
         sabotaged = source.replace("    test_straight_line()", "    # dropped for the bite check", 1)
         self.assertEqual(uncalled_tests(sabotaged), ["test_straight_line"])
+
+    def test_a_comprehension_over_globals_counts_as_dispatch(self):
+        # tests/test_feature_scan.py hands every test_* to run_tests() through a list comprehension.
+        src = ("def test_a(): pass\ndef test_b(): pass\n"
+               "if __name__ == '__main__':\n"
+               "    run_tests([fn for name, fn in list(globals().items()) if name.startswith('test_')])\n")
+        self.assertEqual(uncalled_tests(src), [])
+        # A comprehension over something other than the module globals proves nothing.
+        src = ("def test_a(): pass\ndef test_b(): pass\n"
+               "if __name__ == '__main__':\n"
+               "    run_tests([fn for fn in (test_a,)])\n")
+        self.assertEqual(uncalled_tests(src), ["test_b"])
 
 
 if __name__ == "__main__":
